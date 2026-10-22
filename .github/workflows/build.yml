@@ -1,1 +1,135 @@
+name: Build Android APK
 
+on:
+  push:
+    paths:
+      - "drop/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_RELEASE: "4.3-stable"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "build-tools;34.0.0" "platforms;android-34" || true
+
+      - name: Install Godot and export templates
+        run: |
+          mkdir -p "$HOME/godot" "$HOME/templates" "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          curl -fsSL -o "$HOME/godot.zip" "https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_linux.x86_64.zip"
+          curl -fsSL -o "$HOME/templates.tpz" "https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}/Godot_v${GODOT_RELEASE}_export_templates.tpz"
+          unzip -q "$HOME/godot.zip" -d "$HOME/godot"
+          unzip -q "$HOME/templates.tpz" -d "$HOME/templates"
+          mv "$HOME"/templates/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+          chmod +x "$HOME/godot/Godot_v${GODOT_RELEASE}_linux.x86_64"
+          echo "GODOT_BIN=$HOME/godot/Godot_v${GODOT_RELEASE}_linux.x86_64" >> "$GITHUB_ENV"
+
+      - name: Configure Godot editor settings
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          for name in editor_settings-4.tres editor_settings-${GODOT_VERSION}.tres; do
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\nexport/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\nexport/android/shutdown_adb_on_exit = true\n' "$ANDROID_HOME" "$JAVA_HOME" > "$HOME/.config/godot/$name"
+          done
+
+      - name: Prepare signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_ALIAS: ${{ secrets.ANDROID_KEYSTORE_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          mkdir -p "$HOME/keystore"
+          store="$HOME/keystore/release.keystore"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$store"
+            key_alias="$KEYSTORE_ALIAS"
+            key_password="$KEYSTORE_PASSWORD"
+          else
+            key_alias="imora"
+            key_password="imora-build-pass"
+            keytool -genkeypair -keystore "$store" -alias "$key_alias" -keyalg RSA -keysize 2048 -validity 10000 -storepass "$key_password" -keypass "$key_password" -dname "CN=Imora Studio, O=Imora Studio, C=US"
+          fi
+          {
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$store"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=$key_alias"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=$key_password"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$store"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=$key_alias"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=$key_password"
+          } >> "$GITHUB_ENV"
+
+      - name: Build projects from drop folder
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          mkdir -p build-output
+          zips=()
+          if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
+            while IFS= read -r file; do
+              [ -f "$file" ] && zips+=("$file")
+            done < <(git diff --name-only --diff-filter=AM "$BEFORE_SHA" "$GITHUB_SHA" -- 'drop/*.zip')
+          else
+            for file in drop/*.zip; do
+              [ -f "$file" ] && zips+=("$file")
+            done
+          fi
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No new zip files to build"
+            exit 0
+          fi
+          for zip in "${zips[@]}"; do
+            name="$(basename "$zip" .zip)"
+            work="$RUNNER_TEMP/$name"
+            rm -rf "$work"
+            mkdir -p "$work"
+            unzip -q "$zip" -d "$work"
+            project_file="$(find "$work" -maxdepth 3 -name project.godot -not -path '*/.godot/*' | head -n 1)"
+            if [ -z "$project_file" ]; then
+              echo "project.godot not found in $zip"
+              exit 1
+            fi
+            project_dir="$(dirname "$project_file")"
+            output="$GITHUB_WORKSPACE/build-output/$name.apk"
+            "$GODOT_BIN" --headless --path "$project_dir" --import || true
+            "$GODOT_BIN" --headless --path "$project_dir" --import || true
+            "$GODOT_BIN" --headless --path "$project_dir" --export-release "Android" "$output"
+            if [ ! -f "$output" ]; then
+              echo "Export failed for $zip"
+              exit 1
+            fi
+          done
+
+      - name: Upload APK artifact
+        if: ${{ hashFiles('build-output/*.apk') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: build-output/*.apk
+
+      - name: Publish release
+        if: ${{ hashFiles('build-output/*.apk') != '' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          files: build-output/*.apk
